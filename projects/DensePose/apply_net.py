@@ -5,10 +5,47 @@ import argparse
 import glob
 import logging
 import os
+from pathlib import Path
 import pickle
 import sys
 from typing import Any, ClassVar, Dict, List
 import torch
+import av
+
+import argparse
+import logging
+import os
+import sys
+import weakref
+from collections import OrderedDict
+from typing import Optional
+import torch
+from fvcore.nn.precise_bn import get_bn_modules
+from omegaconf import OmegaConf
+from torch.nn.parallel import DistributedDataParallel
+
+import detectron2.data.transforms as T
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.config import CfgNode, LazyConfig
+from detectron2.data import (
+    MetadataCatalog,
+    build_detection_test_loader,
+    build_detection_train_loader,
+)
+from detectron2.evaluation import (
+    DatasetEvaluator,
+    inference_on_dataset,
+    print_csv_format,
+    verify_results,
+)
+from detectron2.modeling import build_model
+from detectron2.solver import build_lr_scheduler, build_optimizer
+from detectron2.utils import comm
+from detectron2.utils.collect_env import collect_env_info
+from detectron2.utils.env import seed_all_rng
+from detectron2.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter
+from detectron2.utils.file_io import PathManager
+from detectron2.utils.logger import setup_logger
 
 from detectron2.config import CfgNode, get_cfg
 from detectron2.data.detection_utils import read_image
@@ -71,8 +108,57 @@ def register_action(cls: type):
     _ACTION_REGISTRY[cls.COMMAND] = cls
     return cls
 
+class BatchPredictor:
+
+    def __init__(self, cfg):
+        self.cfg = cfg.clone()  # cfg can be modified by model
+        self.model = build_model(self.cfg)
+        self.model.eval()
+        if len(cfg.DATASETS.TEST):
+            self.metadata = MetadataCatalog.get(cfg.DATASETS.TEST[0])
+
+        checkpointer = DetectionCheckpointer(self.model)
+        checkpointer.load(cfg.MODEL.WEIGHTS)
+
+        self.aug = T.ResizeShortestEdge(
+            [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
+        )
+
+        self.input_format = cfg.INPUT.FORMAT
+        assert self.input_format in ["RGB", "BGR"], self.input_format
+
+    def __call__(self, original_image_list):
+        """
+        Args:
+            original_image (np.ndarray): an image of shape (H, W, C) (in BGR order).
+
+        Returns:
+            predictions (dict):
+                the output of the model for one image only.
+                See :doc:`/tutorials/models` for details about the format.
+        """
+        with torch.no_grad():  # https://github.com/sphinx-doc/sphinx/issues/4258
+            input_list = []
+            for original_image in original_image_list:
+                # Apply pre-processing to image.
+                if self.input_format == "RGB":
+                    # whether the model expects BGR inputs or RGB
+                    original_image = original_image[:, :, ::-1]
+                height, width = original_image.shape[:2]
+                image = self.aug.get_transform(original_image).apply_image(original_image)
+                image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+
+                inputs = {"image": image, "height": height, "width": width}
+                input_list.append(inputs)
+
+            predictions = self.model(input_list)
+            
+            return predictions
 
 class InferenceAction(Action):
+
+    predictor = None
+
     @classmethod
     def add_arguments(cls: type, parser: argparse.ArgumentParser):
         super(InferenceAction, cls).add_arguments(parser)
@@ -92,18 +178,31 @@ class InferenceAction(Action):
         opts = []
         cfg = cls.setup_config(args.cfg, args.model, args, opts)
         logger.info(f"Loading model from {args.model}")
-        predictor = DefaultPredictor(cfg)
-        logger.info(f"Loading data from {args.input}")
-        file_list = cls._get_input_file_list(args.input)
-        if len(file_list) == 0:
-            logger.warning(f"No input images for {args.input}")
-            return
+        # Modify: keep predictor in memory
+        if cls.predictor is None:
+            cls.predictor = BatchPredictor(cfg)
+        
+        # Modify: args.input is not directory but video path
+        assert Path(args.input).exists()
+        # logger.info(f"Loading data from {args.input}")
+        # file_list = cls._get_input_file_list(args.input)
+        # if len(file_list) == 0:
+        #     logger.warning(f"No input images for {args.input}")
+        #     return
+        frame_list = []
+        with av.open(args.input) as container:
+            for frame in container.decode(video=0):
+                frame_list.append(frame.to_ndarray(format='rgb24')[:, :, ::-1])
+        
+        frame_list = frame_list[:10]
+
         context = cls.create_context(args, cfg)
-        for file_name in file_list:
-            img = read_image(file_name, format="BGR")  # predictor expects BGR image.
-            with torch.no_grad():
-                outputs = predictor(img)["instances"]
-                cls.execute_on_outputs(context, {"file_name": file_name, "image": img}, outputs)
+        # for file_name in file_list:
+            # img = read_image(file_name, format="BGR")  # predictor expects BGR image.
+        with torch.no_grad():
+            outputs = cls.predictor(frame_list)  # list
+            for i, output in enumerate(outputs):
+                cls.execute_on_outputs(context, {"file_name": 'N/A', "image": frame_list[i]}, output["instances"])
         cls.postexecute(context)
 
     @classmethod
@@ -348,6 +447,10 @@ def main():
     logger = setup_logger(name=LOGGER_NAME)
     logger.setLevel(verbosity_to_level(verbosity))
     args.func(args)
+
+def entrance(yaml_path, model_path, jpg_wildcard, output_path):
+    sys.argv = ['apply_net.py','dump', yaml_path, model_path, jpg_wildcard, '--output', output_path]
+    main()
 
 
 if __name__ == "__main__":
