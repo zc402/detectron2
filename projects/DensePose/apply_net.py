@@ -23,6 +23,7 @@ import torch
 from fvcore.nn.precise_bn import get_bn_modules
 from omegaconf import OmegaConf
 from torch.nn.parallel import DistributedDataParallel
+import numpy as np
 
 import detectron2.data.transforms as T
 from detectron2.checkpoint import DetectionCheckpointer
@@ -112,6 +113,9 @@ class BatchPredictor:
 
     def __init__(self, cfg):
         self.cfg = cfg.clone()  # cfg can be modified by model
+        # My modifications---------------
+        min_size_test = cfg.INPUT.MIN_SIZE_TEST  # 480
+        #--------------------------------
         self.model = build_model(self.cfg)
         self.model.eval()
         if len(cfg.DATASETS.TEST):
@@ -121,7 +125,7 @@ class BatchPredictor:
         checkpointer.load(cfg.MODEL.WEIGHTS)
 
         self.aug = T.ResizeShortestEdge(
-            [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
+            [min_size_test, min_size_test], cfg.INPUT.MAX_SIZE_TEST
         )
 
         self.input_format = cfg.INPUT.FORMAT
@@ -157,7 +161,7 @@ class BatchPredictor:
 
 class InferenceAction(Action):
 
-    predictor = None
+    predictor = None  # Keep this predictor in memory
 
     @classmethod
     def add_arguments(cls: type, parser: argparse.ArgumentParser):
@@ -189,20 +193,38 @@ class InferenceAction(Action):
         # if len(file_list) == 0:
         #     logger.warning(f"No input images for {args.input}")
         #     return
+
+        context = cls.create_context(args, cfg)
+
+        def pred_list(frames):
+            with torch.no_grad():
+                outputs = cls.predictor(frames)  # list
+                for i, output in enumerate(outputs):
+                    cls.execute_on_outputs(context, {"file_name": 'N/A', "image": frames[i]}, output["instances"])
+                    if len(output["instances"].scores) == 0:
+                        logger.warning(f'no person bounding box. {args.input}')
+
+
+        batch_size = 20
         frame_list = []
         with av.open(args.input) as container:
             for frame in container.decode(video=0):
-                frame_list.append(frame.to_ndarray(format='rgb24')[:, :, ::-1])
-        
-        frame_list = frame_list[:10]
+                frame = frame.to_ndarray(format='rgb24')[:, :, ::-1]  # BGR input
+                # Padding, so human is smaller and detectable
+                # Original: 240H 320W
+                bg = np.zeros((480, 640, 3))  # 480 640
+                bg[120:360, 160:480, :] = frame
 
-        context = cls.create_context(args, cfg)
+                frame_list.append(bg)  
+                if len(frame_list) >= batch_size:
+                    pred_list(frame_list)
+                    frame_list = []
+            if len(frame_list) > 0:
+                pred_list(frame_list)
+        
         # for file_name in file_list:
             # img = read_image(file_name, format="BGR")  # predictor expects BGR image.
-        with torch.no_grad():
-            outputs = cls.predictor(frame_list)  # list
-            for i, output in enumerate(outputs):
-                cls.execute_on_outputs(context, {"file_name": 'N/A', "image": frame_list[i]}, output["instances"])
+
         cls.postexecute(context)
 
     @classmethod
